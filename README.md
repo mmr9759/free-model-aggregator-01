@@ -23,7 +23,9 @@ wire its auth header names.
   system prompt, user text, images, tool definitions and tool choice, stop
   sequences, `max_tokens` and JSON mode are carried untouched, and the answer
   comes back with the provider's text whole, its usage counts and its stop
-  reason mapped onto the client's family. JSON-mode requests from an OpenAI
+  reason mapped onto the client's family. A refusal is retried once on the
+  same provider (usually one bad call number on its schedule) before the
+  request fails over to the next candidate. JSON-mode requests from an OpenAI
   client are never sent to an anthropic-wire provider, whose wire cannot
   carry `response_format`.
 

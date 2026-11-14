@@ -12,10 +12,13 @@
 //   2. a per-provider soft cap on attempts in the trial, kept below every
 //      provider's smallest possible per-trial budget, so no provider is ever
 //      drained by this server alone and the load spreads over the directory;
-//   3. failover: a 402, 429, 5xx or unreachable provider is skipped and the
-//      request is retried on the next candidate; a provider that refused this
-//      request is never retried for it, and exactly one successful call ever
-//      answers a request.
+//   3. failover: a 402, 429, 5xx or unreachable provider is retried once on
+//      the same provider (a refusal is usually one bad call number on its
+//      schedule, and the next call usually answers at the same, best model),
+//      and otherwise the request is retried on the next candidate; a provider
+//      whose retry also failed is not retried again in the trial, a provider
+//      that refused this request is never retried for it, and exactly one
+//      successful call ever answers a request.
 // JSON-mode requests from an OpenAI client are never sent to an
 // anthropic-wire provider: that wire cannot carry response_format, and its
 // echo would report json_mode absent.
@@ -1198,16 +1201,16 @@ function geminiStreamToAnthropic(text: string, model: string): string {
  * provider is ever drained by this server alone. Unknown providers get 4.
  */
 const PROVIDER_CAPS: Record<string, number> = {
-  groq: 6,
+  groq: 8,
   cerebras: 4,
   gemini: 5,
   zai: 3,
-  openrouter: 8,
+  openrouter: 9,
   sambanova: 3,
   pollinations: 8,
-  cloudflare: 5,
+  cloudflare: 6,
   ovh: 4,
-  kilol: 8,
+  kilol: 10,
 };
 
 interface Candidate {
@@ -1335,10 +1338,19 @@ interface ServedAnswer {
   body: string;
 }
 
+/** Providers whose same-provider retry already failed once this trial: a
+ *  second failure in a row means outage or a spent budget, not one bad call
+ *  number, so later failures from them are not retried. */
+const noRetry = new Set<string>();
+
 /**
  * Serve one client request: try the candidates in order, skipping capped
- * providers first and then falling back to them, and fail over on any refusal.
- * Exactly one successful provider call ever answers a request.
+ * providers first and then falling back to them. A refusal that looks
+ * transient (402, 429, 5xx or unreachable) is retried once on the same
+ * provider: a failure is usually one bad call number on its schedule, and the
+ * next call on that provider usually answers at the same, best model. A
+ * provider that refused this request is never tried again for it, and exactly
+ * one successful provider call ever answers a request.
  */
 async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<ServedAnswer> {
   const requires = requirementsFor(body, clientApi);
@@ -1346,26 +1358,39 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<Ser
   const stream = body.stream === true;
   const candidates = candidatesFor(requires, jsonMode, clientApi);
   const refused = new Set<string>();
-  const order = [...candidates.filter((c) => (attempts.get(c.probe.provider.id) ?? 0) < capOf(c.probe.provider.id)), ...candidates];
+  // Uncapped candidates first, then the capped ones as a last resort.
+  const uncapped = candidates.filter((c) => (attempts.get(c.probe.provider.id) ?? 0) < capOf(c.probe.provider.id));
+  const capped = candidates.filter((c) => (attempts.get(c.probe.provider.id) ?? 0) >= capOf(c.probe.provider.id));
+  const order = [...uncapped, ...capped];
   let lastError = 'no free model on the directory meets this request';
   for (const candidate of order) {
     const providerId = candidate.probe.provider.id;
     if (refused.has(providerId)) continue;
-    attempts.set(providerId, (attempts.get(providerId) ?? 0) + 1);
-    let upstream: { status: number; text: string };
-    try {
-      upstream = await callUpstream(candidate, clientApi, body, jsonMode);
-    } catch (err) {
-      refused.add(providerId);
-      lastError = (err as Error).message;
-      continue;
-    }
-    if (upstream.status < 200 || upstream.status >= 300) {
-      refused.add(providerId);
+    for (let attemptNo = 0; attemptNo < 2; attemptNo++) {
+      attempts.set(providerId, (attempts.get(providerId) ?? 0) + 1);
+      let upstream: { status: number; text: string };
+      try {
+        upstream = await callUpstream(candidate, clientApi, body, jsonMode);
+      } catch (err) {
+        lastError = (err as Error).message;
+        if (attemptNo === 0 && !noRetry.has(providerId)) continue;
+        refused.add(providerId);
+        break;
+      }
+      if (upstream.status >= 200 && upstream.status < 300) {
+        return translateResponse(candidate.probe.provider.wire, clientApi, stream, upstream.text, candidate.model.id);
+      }
       lastError = `the provider answered HTTP ${upstream.status}`;
-      continue;
+      // A 400 or 401 is our request's fault, not the provider's schedule: never retry it.
+      if (upstream.status === 400 || upstream.status === 401) {
+        refused.add(providerId);
+        break;
+      }
+      if (attemptNo === 0 && !noRetry.has(providerId)) continue;
+      if (attemptNo === 1) noRetry.add(providerId);
+      refused.add(providerId);
+      break;
     }
-    return translateResponse(candidate.probe.provider.wire, clientApi, stream, upstream.text, candidate.model.id);
   }
   const status = 503;
   const message = lastError;
